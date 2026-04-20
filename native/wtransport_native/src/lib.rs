@@ -15,13 +15,14 @@ use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use wtransport::{
     endpoint::{endpoint_side::Server, IncomingSession, SessionRequest},
     stream::{RecvStream, SendStream},
-    Connection, Endpoint, Identity, ServerConfig,
+    ClientConfig, Connection, Endpoint, Identity, ServerConfig,
 };
 
 mod atoms {
     rustler::atoms! {
         ok,
         error,
+        zone_datagram,
         wtransport_error,
         wtransport_session_request,
         wtransport_connection_request,
@@ -46,6 +47,19 @@ struct XDataSender(mpsc::Sender<OwnedBinary>);
 impl Resource for XShutdownSender {}
 impl Resource for XRequestSender {}
 impl Resource for XDataSender {}
+
+struct XClientSendTx(mpsc::Sender<Vec<u8>>);
+struct XClientShutdown(broadcast::Sender<()>);
+
+impl Resource for XClientSendTx {}
+impl Resource for XClientShutdown {}
+
+#[derive(NifStruct)]
+#[module = "Wtransport.Client"]
+struct NifClient {
+    send_tx: ResourceArc<XClientSendTx>,
+    shutdown_tx: ResourceArc<XClientShutdown>,
+}
 
 #[derive(NifStruct)]
 #[module = "Wtransport.Runtime"]
@@ -87,6 +101,8 @@ fn load(env: Env, _term: Term) -> bool {
     env.register::<XShutdownSender>()
         .and_then(|_| env.register::<XRequestSender>())
         .and_then(|_| env.register::<XDataSender>())
+        .and_then(|_| env.register::<XClientSendTx>())
+        .and_then(|_| env.register::<XClientShutdown>())
         .is_ok()
 }
 
@@ -638,6 +654,125 @@ fn send_data(
         }
         Err(error) => Err(error.to_string()),
     }
+}
+
+// ── client NIFs ──────────────────────────────────────────────────────────────
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn connect_client(url: String, cert_hash_b64: String, owner_pid: LocalPid) -> Result<NifClient, String> {
+    let expected_hash = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        cert_hash_b64.trim(),
+    )
+    .map_err(|e| format!("bad cert_hash base64: {e}"))?;
+
+    if expected_hash.len() != 32 {
+        return Err(format!("cert_hash must be 32 bytes, got {}", expected_hash.len()));
+    }
+
+    let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
+    let shutdown_tx2 = shutdown_tx.clone();
+
+    let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = result_tx.send(Err(e.to_string()));
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            let config = ClientConfig::builder()
+                .with_bind_default()
+                .with_server_certificate_hashes([
+                    wtransport::tls::Sha256Digest::new(
+                        expected_hash
+                            .try_into()
+                            .expect("checked len==32 above"),
+                    ),
+                ])
+                .build();
+
+            let endpoint = match Endpoint::client(config) {
+                Ok(ep) => ep,
+                Err(e) => {
+                    let _ = result_tx.send(Err(e.to_string()));
+                    return;
+                }
+            };
+
+            let conn = match endpoint.connect(&url).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = result_tx.send(Err(e.to_string()));
+                    return;
+                }
+            };
+
+            let _ = result_tx.send(Ok(()));
+
+            let mut shutdown_rx = shutdown_tx2.subscribe();
+
+            tokio::select! {
+                _ = async {
+                    loop {
+                        tokio::select! {
+                            dgram = conn.receive_datagram() => {
+                                match dgram {
+                                    Ok(data) => {
+                                        let bytes: Vec<u8> = data.payload().to_vec();
+                                        let mut owned_env = OwnedEnv::new();
+                                        let _ = owned_env.send_and_clear(&owner_pid, |env| {
+                                            let mut owned = OwnedBinary::new(bytes.len()).unwrap();
+                                            owned.as_mut_slice().copy_from_slice(&bytes);
+                                            (atoms::zone_datagram(), owned.release(env)).encode(env)
+                                        });
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            Some(data) = send_rx.recv() => {
+                                let _ = conn.send_datagram(data);
+                            }
+                        }
+                    }
+                } => {}
+                _ = shutdown_rx.recv() => {}
+            }
+        });
+    });
+
+    match result_rx.recv() {
+        Ok(Ok(())) => Ok(NifClient {
+            send_tx: ResourceArc::new(XClientSendTx(send_tx)),
+            shutdown_tx: ResourceArc::new(XClientShutdown(shutdown_tx)),
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[rustler::nif]
+fn send_datagram_client(client: NifClient, data: Binary) -> Result<(), String> {
+    let bytes = data.as_slice().to_vec();
+    client
+        .send_tx
+        .0
+        .blocking_send(bytes)
+        .map_err(|e| e.to_string())
+}
+
+#[rustler::nif]
+fn disconnect_client(client: NifClient) -> Result<(), String> {
+    let _ = client.shutdown_tx.0.send(());
+    Ok(())
 }
 
 rustler::init!("Elixir.Wtransport.Native", load = load);
