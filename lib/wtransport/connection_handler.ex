@@ -19,6 +19,38 @@ defmodule Wtransport.ConnectionHandler do
   @callback handle_error(reason :: String.t(), connection :: Connection.t(), state :: term()) ::
               :ok
 
+  # Module-level dispatch helpers — see Wtransport.StreamHandler for rationale.
+
+  @spec dispatch_request(
+          {:continue, term()} | :close,
+          reference(),
+          Connection.t(),
+          term()
+        ) :: {:noreply, {Connection.t(), term()}} | {:stop, :normal, {Connection.t(), term()}}
+  def dispatch_request({:continue, new_state}, request_tx, connection, _state) do
+    {:ok, {}} = Wtransport.Native.reply_request(request_tx, :ok, self())
+    {:noreply, {connection, new_state}}
+  end
+
+  def dispatch_request(_, request_tx, connection, state) do
+    {:ok, {}} = Wtransport.Native.reply_request(request_tx, :error, self())
+    {:stop, :normal, {connection, state}}
+  end
+
+  @spec dispatch_datagram(
+          {:continue, term()} | :close,
+          Connection.t(),
+          term()
+        ) ::
+          {:noreply, {Connection.t(), term()}} | {:stop, :normal, {Connection.t(), term()}}
+  def dispatch_datagram({:continue, new_state}, connection, _state) do
+    {:noreply, {connection, new_state}}
+  end
+
+  def dispatch_datagram(_, connection, state) do
+    {:stop, :normal, {connection, state}}
+  end
+
   defmacro __using__(_opts) do
     quote location: :keep do
       @behaviour Wtransport.ConnectionHandler
@@ -85,18 +117,12 @@ defmodule Wtransport.ConnectionHandler do
       def handle_continue(:wtransport_session_request, {%Connection{} = connection, state}) do
         Logger.debug(":wtransport_session_request")
 
-        case handle_session(connection.session) do
-          {:continue, new_state} ->
-            {:ok, {}} = Wtransport.Native.reply_request(connection.request_tx, :ok, self())
-
-            {:noreply, {connection, new_state}}
-
-          _ ->
-            {:ok, {}} =
-              Wtransport.Native.reply_request(connection.request_tx, :error, self())
-
-            {:stop, :normal, {connection, state}}
-        end
+        Wtransport.ConnectionHandler.dispatch_request(
+          handle_session(connection.session),
+          connection.request_tx,
+          connection,
+          state
+        )
       end
 
       @impl true
@@ -108,19 +134,12 @@ defmodule Wtransport.ConnectionHandler do
 
         connection = struct(connection, Map.from_struct(request))
 
-        case handle_connection(connection, state) do
-          {:continue, new_state} ->
-            {:ok, {}} =
-              Wtransport.Native.reply_request(connection.request_tx, :ok, self())
-
-            {:noreply, {connection, new_state}}
-
-          _ ->
-            {:ok, {}} =
-              Wtransport.Native.reply_request(connection.request_tx, :error, self())
-
-            {:stop, :normal, {connection, state}}
-        end
+        Wtransport.ConnectionHandler.dispatch_request(
+          handle_connection(connection, state),
+          connection.request_tx,
+          connection,
+          state
+        )
       end
 
       @impl true
@@ -133,18 +152,19 @@ defmodule Wtransport.ConnectionHandler do
       end
 
       @impl true
-      def handle_info({:wtransport_datagram_received, dgram}, {%Connection{} = connection, state}) do
+      def handle_info(
+            {:wtransport_datagram_received, dgram},
+            {%Connection{} = connection, state}
+          ) do
         if connection.log_network_data do
           Logger.debug(":wtransport_datagram_received")
         end
 
-        case handle_datagram(dgram, connection, state) do
-          {:continue, new_state} ->
-            {:noreply, {connection, new_state}}
-
-          _ ->
-            {:stop, :normal, {connection, state}}
-        end
+        Wtransport.ConnectionHandler.dispatch_datagram(
+          handle_datagram(dgram, connection, state),
+          connection,
+          state
+        )
       end
 
       @impl true
