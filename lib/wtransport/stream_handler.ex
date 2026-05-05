@@ -14,13 +14,53 @@ defmodule Wtransport.StreamHandler do
 
   @callback handle_error(reason :: String.t(), stream :: Stream.t(), state :: term()) :: :ok
 
-  # Cross-module spec boundary: Elixir's type checker uses @spec for cross-module
-  # calls, so wrapping handler results through this function prevents the checker
-  # from narrowing `{:continue, t} | :stop` to a single branch and producing
-  # dead-clause warnings in the macro-generated handle_info/2 clauses.
-  @spec unwrap_result(term()) :: {:continue, term()} | :stop
-  def unwrap_result({:continue, state}), do: {:continue, state}
-  def unwrap_result(_), do: :stop
+  # Module-level dispatch helpers. These live here (not in the macro-generated
+  # code) so that Elixir's type checker and Dialyzer analyse them against the
+  # full `{:continue, term()} | :close` union declared in the @spec, rather
+  # than narrowing based on a concrete callback implementation. This prevents
+  # dead-clause warnings in modules that `use Wtransport.StreamHandler`.
+
+  @spec dispatch_request(
+          {:continue, term()} | :close,
+          reference(),
+          Stream.t(),
+          term()
+        ) :: {:noreply, {Stream.t(), term()}} | {:stop, :normal, {Stream.t(), term()}}
+  def dispatch_request({:continue, new_state}, request_tx, stream, _conn_state) do
+    {:ok, {}} = Wtransport.Native.reply_request(request_tx, :ok, self())
+    {:noreply, {stream, new_state}}
+  end
+
+  def dispatch_request(_, request_tx, stream, conn_state) do
+    {:ok, {}} = Wtransport.Native.reply_request(request_tx, :error, self())
+    {:stop, :normal, {stream, conn_state}}
+  end
+
+  @spec dispatch_data(
+          {:continue, term()} | :close,
+          Stream.t(),
+          term()
+        ) :: {:noreply, {Stream.t(), term()}} | {:stop, :normal, {Stream.t(), term()}}
+  def dispatch_data({:continue, new_state}, stream, _state) do
+    {:noreply, {stream, new_state}}
+  end
+
+  def dispatch_data(_, stream, state) do
+    {:stop, :normal, {stream, state}}
+  end
+
+  @spec dispatch_close(
+          {:continue, term()} | :close,
+          Stream.t(),
+          term()
+        ) :: {:noreply, {Stream.t(), term()}} | {:stop, :normal, {Stream.t(), term()}}
+  def dispatch_close({:continue, new_state}, stream, _state) do
+    {:noreply, {stream, new_state}}
+  end
+
+  def dispatch_close(_, stream, state) do
+    {:stop, :normal, {stream, state}}
+  end
 
   defmacro __using__(_opts) do
     quote location: :keep do
@@ -86,17 +126,12 @@ defmodule Wtransport.StreamHandler do
       def handle_continue(:wtransport_stream_request, {%Stream{} = stream, conn_state}) do
         Logger.debug(":wtransport_stream_request")
 
-        case Wtransport.StreamHandler.unwrap_result(handle_stream(stream, conn_state)) do
-          {:continue, new_state} ->
-            {:ok, {}} = Wtransport.Native.reply_request(stream.request_tx, :ok, self())
-
-            {:noreply, {stream, new_state}}
-
-          :stop ->
-            {:ok, {}} = Wtransport.Native.reply_request(stream.request_tx, :error, self())
-
-            {:stop, :normal, {stream, conn_state}}
-        end
+        Wtransport.StreamHandler.dispatch_request(
+          handle_stream(stream, conn_state),
+          stream.request_tx,
+          stream,
+          conn_state
+        )
       end
 
       @impl true
@@ -127,26 +162,14 @@ defmodule Wtransport.StreamHandler do
           Logger.debug(":wtransport_data_received")
         end
 
-        case Wtransport.StreamHandler.unwrap_result(handle_data(data, stream, state)) do
-          {:continue, new_state} ->
-            {:noreply, {stream, new_state}}
-
-          :stop ->
-            {:stop, :normal, {stream, state}}
-        end
+        Wtransport.StreamHandler.dispatch_data(handle_data(data, stream, state), stream, state)
       end
 
       @impl true
       def handle_info(:wtransport_stream_closed, {%Stream{} = stream, state}) do
         Logger.debug(":wtransport_stream_closed")
 
-        case Wtransport.StreamHandler.unwrap_result(handle_close(stream, state)) do
-          {:continue, new_state} ->
-            {:noreply, {stream, new_state}}
-
-          :stop ->
-            {:stop, :normal, {stream, state}}
-        end
+        Wtransport.StreamHandler.dispatch_close(handle_close(stream, state), stream, state)
       end
     end
   end
