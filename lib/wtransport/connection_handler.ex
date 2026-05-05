@@ -19,6 +19,10 @@ defmodule Wtransport.ConnectionHandler do
   @callback handle_error(reason :: String.t(), connection :: Connection.t(), state :: term()) ::
               :ok
 
+  @spec unwrap_result(term()) :: {:continue, term()} | :stop
+  def unwrap_result({:continue, state}), do: {:continue, state}
+  def unwrap_result(_), do: :stop
+
   defmacro __using__(_opts) do
     quote location: :keep do
       @behaviour Wtransport.ConnectionHandler
@@ -85,13 +89,13 @@ defmodule Wtransport.ConnectionHandler do
       def handle_continue(:wtransport_session_request, {%Connection{} = connection, state}) do
         Logger.debug(":wtransport_session_request")
 
-        case handle_session(connection.session) do
+        case Wtransport.ConnectionHandler.unwrap_result(handle_session(connection.session)) do
           {:continue, new_state} ->
             {:ok, {}} = Wtransport.Native.reply_request(connection.request_tx, :ok, self())
 
             {:noreply, {connection, new_state}}
 
-          _ ->
+          :stop ->
             {:ok, {}} =
               Wtransport.Native.reply_request(connection.request_tx, :error, self())
 
@@ -108,14 +112,14 @@ defmodule Wtransport.ConnectionHandler do
 
         connection = struct(connection, Map.from_struct(request))
 
-        case handle_connection(connection, state) do
+        case Wtransport.ConnectionHandler.unwrap_result(handle_connection(connection, state)) do
           {:continue, new_state} ->
             {:ok, {}} =
               Wtransport.Native.reply_request(connection.request_tx, :ok, self())
 
             {:noreply, {connection, new_state}}
 
-          _ ->
+          :stop ->
             {:ok, {}} =
               Wtransport.Native.reply_request(connection.request_tx, :error, self())
 
@@ -138,11 +142,11 @@ defmodule Wtransport.ConnectionHandler do
           Logger.debug(":wtransport_datagram_received")
         end
 
-        case handle_datagram(dgram, connection, state) do
+        case Wtransport.ConnectionHandler.unwrap_result(handle_datagram(dgram, connection, state)) do
           {:continue, new_state} ->
             {:noreply, {connection, new_state}}
 
-          _ ->
+          :stop ->
             {:stop, :normal, {connection, state}}
         end
       end

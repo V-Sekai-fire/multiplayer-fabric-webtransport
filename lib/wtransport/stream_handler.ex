@@ -14,6 +14,14 @@ defmodule Wtransport.StreamHandler do
 
   @callback handle_error(reason :: String.t(), stream :: Stream.t(), state :: term()) :: :ok
 
+  # Cross-module spec boundary: Elixir's type checker uses @spec for cross-module
+  # calls, so wrapping handler results through this function prevents the checker
+  # from narrowing `{:continue, t} | :stop` to a single branch and producing
+  # dead-clause warnings in the macro-generated handle_info/2 clauses.
+  @spec unwrap_result(term()) :: {:continue, term()} | :stop
+  def unwrap_result({:continue, state}), do: {:continue, state}
+  def unwrap_result(_), do: :stop
+
   defmacro __using__(_opts) do
     quote location: :keep do
       @behaviour Wtransport.StreamHandler
@@ -78,13 +86,13 @@ defmodule Wtransport.StreamHandler do
       def handle_continue(:wtransport_stream_request, {%Stream{} = stream, conn_state}) do
         Logger.debug(":wtransport_stream_request")
 
-        case handle_stream(stream, conn_state) do
+        case Wtransport.StreamHandler.unwrap_result(handle_stream(stream, conn_state)) do
           {:continue, new_state} ->
             {:ok, {}} = Wtransport.Native.reply_request(stream.request_tx, :ok, self())
 
             {:noreply, {stream, new_state}}
 
-          _ ->
+          :stop ->
             {:ok, {}} = Wtransport.Native.reply_request(stream.request_tx, :error, self())
 
             {:stop, :normal, {stream, conn_state}}
@@ -119,11 +127,11 @@ defmodule Wtransport.StreamHandler do
           Logger.debug(":wtransport_data_received")
         end
 
-        case handle_data(data, stream, state) do
+        case Wtransport.StreamHandler.unwrap_result(handle_data(data, stream, state)) do
           {:continue, new_state} ->
             {:noreply, {stream, new_state}}
 
-          _ ->
+          :stop ->
             {:stop, :normal, {stream, state}}
         end
       end
@@ -132,11 +140,11 @@ defmodule Wtransport.StreamHandler do
       def handle_info(:wtransport_stream_closed, {%Stream{} = stream, state}) do
         Logger.debug(":wtransport_stream_closed")
 
-        case handle_close(stream, state) do
+        case Wtransport.StreamHandler.unwrap_result(handle_close(stream, state)) do
           {:continue, new_state} ->
             {:noreply, {stream, new_state}}
 
-          _ ->
+          :stop ->
             {:stop, :normal, {stream, state}}
         end
       end
